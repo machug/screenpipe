@@ -87,9 +87,8 @@ fn selected_detector_mode() -> MeetingDetectorMode {
     // the detector idles; UI scanning is no loss there because its Linux
     // backend is a stub anyway. Override on any platform with
     // SCREENPIPE_MEETING_DETECTOR.
-    let audio_process_is_default = cfg!(target_os = "macos")
-        || cfg!(target_os = "windows")
-        || cfg!(target_os = "linux");
+    let audio_process_is_default =
+        cfg!(target_os = "macos") || cfg!(target_os = "windows") || cfg!(target_os = "linux");
     selected_detector_mode_from(
         std::env::var("SCREENPIPE_MEETING_DETECTOR").ok().as_deref(),
         audio_process_is_default,
