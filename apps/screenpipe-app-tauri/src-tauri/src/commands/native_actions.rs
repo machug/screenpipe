@@ -522,12 +522,9 @@ pub(crate) fn dispatch_notification_action(json: String) {
             warn!("copy notification action has no value: {}", json);
             return;
         };
-        std::thread::spawn(move || {
-            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
-                Ok(()) => {}
-                Err(e) => error!("failed to copy notification action value: {}", e),
-            }
-        });
+        if let Err(e) = crate::commands::set_clipboard_text(text) {
+            error!("failed to copy notification action value: {}", e);
+        }
         return;
     }
 
