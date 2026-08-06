@@ -106,7 +106,9 @@ sys-locale = "=0.3.2"
 # refresh. Keep the pre-macOS-27 layout until the caller is version-aware.
 libc = "=0.2.186"
 anyhow = "1.0.71"
-arboard = "3.4"
+# wayland-data-control: without it, Wayland sessions get the clipboard only via
+# the XWayland bridge, which depends on X11 window focus and silently drops copies.
+arboard = { version = "3.4", features = ["wayland-data-control"] }
 
 # System information
 sysinfo = "=0.29.0"
