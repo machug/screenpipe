@@ -4544,6 +4544,32 @@ pub(crate) fn set_clipboard_image(image: arboard::ImageData<'static>) -> Result<
     }
 }
 
+/// Put HTML plus its plain-text alternative on the system clipboard in one
+/// write. Same Linux ownership rules as [`set_clipboard_text`]; arboard exposes
+/// no HTML read-back, so the handoff is confirmed against the plain-text
+/// alternative that `set().html()` publishes alongside the markup.
+pub(crate) fn set_clipboard_html(html: String, text: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use arboard::SetExtLinux;
+        let expected = text.clone();
+        set_clipboard_linux(
+            move |clipboard| clipboard.set().wait().html(html, Some(text)),
+            move |clipboard| clipboard.get_text().is_ok_and(|read| read == expected),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("clipboard error: {}", e))?;
+        clipboard
+            .set()
+            .html(html, Some(text))
+            .map_err(|e| format!("failed to set clipboard: {}", e))?;
+        Ok(())
+    }
+}
+
 /// Copy a frame image to the system clipboard (native API, works in Tauri webview).
 /// Fetches the frame from the local server and uses arboard for clipboard access.
 #[tauri::command]
@@ -4608,12 +4634,7 @@ pub async fn copy_text_to_clipboard(text: String) -> Result<(), String> {
 #[tauri::command]
 #[specta::specta]
 pub async fn copy_rich_text_to_clipboard(html: String, text: String) -> Result<(), String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("clipboard error: {}", e))?;
-    clipboard
-        .set()
-        .html(html, Some(text))
-        .map_err(|e| format!("failed to set clipboard: {}", e))?;
-    Ok(())
+    set_clipboard_html(html, text)
 }
 
 /// Open a local markdown note in Obsidian (if available), then fallback to OS default app.
@@ -4974,5 +4995,18 @@ mod clipboard_tests {
         // The final owner keeps serving after the superseded waiters exited.
         std::thread::sleep(std::time::Duration::from_millis(250));
         assert_eq!(read_clipboard(), last);
+    }
+
+    /// The rich-text path (meeting summary "copy") writes HTML and a plain-text
+    /// alternative in one go. A plain-text target must still see the summary
+    /// after the command returns, not an empty selection.
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "requires a display server (X11/Wayland); run with -- --ignored"]
+    fn set_clipboard_html_alt_text_is_immediately_pastable() {
+        let marker = format!("screenpipe-clipboard-html-{}", std::process::id());
+        let html = format!("<p><strong>{marker}</strong></p>");
+        super::set_clipboard_html(html, marker.clone()).expect("set clipboard");
+        assert_eq!(read_clipboard(), marker);
     }
 }
