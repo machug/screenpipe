@@ -799,7 +799,7 @@ mod platform {
     //! chains, loopbacks) carry no `application.process.id` and are dropped —
     //! only real client processes count as meeting evidence.
     use super::{is_screenpipe_process, AudioInputProcess, AudioProcessSnapshot};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::process::Command;
     use tracing::debug;
 
@@ -944,6 +944,23 @@ mod platform {
             .as_array()
             .ok_or_else(|| "pw-dump output is not a JSON array".to_string())?;
 
+        // Clients reaching PipeWire through its ALSA compatibility layer
+        // (teams-for-linux, and anything else using the alsa plugin) leave
+        // `application.process.*` off the capture node entirely — the identity
+        // lives on the Client object the node names in `client.id`. Index the
+        // clients first so the node pass can fall back to them; without this a
+        // real meeting app looks exactly like a graph-internal filter node and
+        // is dropped, so no meeting is ever detected.
+        let mut clients: HashMap<i64, &serde_json::Value> = HashMap::new();
+        for obj in objects {
+            if obj["type"].as_str() != Some("PipeWire:Interface:Client") {
+                continue;
+            }
+            if let Some(id) = obj["id"].as_i64() {
+                clients.insert(id, &obj["info"]["props"]);
+            }
+        }
+
         let mut out = Vec::new();
         let mut seen: HashSet<(i32, String)> = HashSet::new();
         for obj in objects {
@@ -954,7 +971,12 @@ mod platform {
             if props["media.class"].as_str() != Some("Stream/Input/Audio") {
                 continue;
             }
-            let Some(pid) = prop_i32(&props["application.process.id"]) else {
+            let client_props = prop_i32(&props["client.id"])
+                .and_then(|id| clients.get(&i64::from(id)).copied());
+            let client_prop = |key: &str| client_props.map(|c| &c[key]);
+            let Some(pid) = prop_i32(&props["application.process.id"])
+                .or_else(|| client_prop("application.process.id").and_then(prop_i32))
+            else {
                 // Graph-internal node (filter chain, loopback): not a client.
                 debug!(
                     "audio-process snapshot: skip pid-less capture node {:?}",
@@ -971,10 +993,17 @@ mod platform {
                 audio_object_id: obj["id"].as_u64().map(|id| id as u32),
                 pid: Some(pid),
                 bundle_id: None,
+                // The ALSA-layer node labels itself "PipeWire ALSA [teams-for-linux]"
+                // and carries no binary, so the client's binary is what native
+                // identity matching keys on.
                 process_name: props["application.process.binary"]
                     .as_str()
+                    .or_else(|| client_prop("application.process.binary").and_then(|v| v.as_str()))
                     .map(str::to_string),
-                owner_app_name: props["application.name"].as_str().map(str::to_string),
+                owner_app_name: props["application.name"]
+                    .as_str()
+                    .or_else(|| client_prop("application.name").and_then(|v| v.as_str()))
+                    .map(str::to_string),
                 owner_bundle_id: None,
                 first_seen_at_ms: None,
             };
@@ -1084,6 +1113,34 @@ mod platform {
                 "media.name":"capture","application.name":"screenpipe",
                 "application.process.binary":"screenpipe-app","application.process.id":"999"}}
         ]"#;
+
+        /// Verbatim shape of a teams-for-linux call on PipeWire 1.4 (Arch,
+        /// observed live): the capture node reaches PipeWire through the ALSA
+        /// compatibility layer, so it carries no `application.process.*` at
+        /// all — only `client.id` pointing at the Client that does. The
+        /// pid-less rnnoise filter node has no client.id and must still drop.
+        const PW_DUMP_ALSA_CLIENT_FIXTURE: &str = r#"[
+            {"id":36,"type":"PipeWire:Interface:Node","info":{"props":{
+                "media.class":"Stream/Input/Audio","node.name":"effect_input.rnnoise"}}},
+            {"id":600,"type":"PipeWire:Interface:Client","info":{"props":{
+                "application.name":"PipeWire ALSA [teams-for-linux]",
+                "application.process.binary":"teams-for-linux",
+                "application.process.id":182248}}},
+            {"id":594,"type":"PipeWire:Interface:Node","info":{"props":{
+                "media.class":"Stream/Input/Audio","node.name":"alsa_capture.teams-for-linux",
+                "application.name":"PipeWire ALSA [teams-for-linux]","client.id":600}}}
+        ]"#;
+
+        #[test]
+        fn pw_dump_resolves_alsa_layer_clients_via_client_id() {
+            let processes = parse_pw_dump(PW_DUMP_ALSA_CLIENT_FIXTURE, 1).unwrap();
+            assert_eq!(processes.len(), 1, "{processes:?}");
+            let teams = &processes[0];
+            assert_eq!(teams.pid, Some(182248));
+            // Native identity matching keys on the binary name.
+            assert_eq!(teams.process_name.as_deref(), Some("teams-for-linux"));
+            assert_eq!(teams.audio_object_id, Some(594));
+        }
 
         #[test]
         fn pw_dump_keeps_only_client_capture_streams() {
