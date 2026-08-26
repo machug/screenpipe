@@ -1446,9 +1446,100 @@ fn local_diarization_segment(
     }
 }
 
+/// A one-word row cannot be attributed at all: the proportional split rounds
+/// to the nearest word, so its error is the whole row. Two is the smallest
+/// row that can survive that rounding and still read as language.
+///
+/// Speech segmentation splits on pauses, so a 30s chunk routinely yields more
+/// segments than the transcript has phrases; dealing words out across all of
+/// them produced rows like "All" / "right," / "okay," / "we", each rendered as
+/// its own speaker turn. Kept deliberately low — a larger floor would also
+/// merge genuine short exchanges, which is a different behaviour, not a fix.
+const MIN_WORDS_PER_DIARIZED_SEGMENT: usize = 2;
+
+/// Merge diarization segments until each can carry a readable share of the
+/// transcript.
+///
+/// Text is assigned to segments by time proportion alone — there are no word
+/// timestamps to align against — so accuracy is bounded by how coarse the
+/// segments are. Two segments that between them hold four words cannot be
+/// attributed correctly no matter how the words are dealt; splitting there
+/// only guarantees that both rows are wrong AND unreadable. Coalescing first
+/// keeps attribution at the granularity the evidence actually supports.
+///
+/// Adjacent segments sharing a speaker always merge. Beyond that, a segment
+/// too short to earn `MIN_WORDS_PER_DIARIZED_SEGMENT` at the chunk's average
+/// speaking rate is absorbed into the run being built, which then takes the
+/// speaker of whichever constituent held the floor longest.
+fn coalesce_diarization_for_text(
+    segments: Vec<TranscriptionDiarizationSegment>,
+    word_count: usize,
+    duration_secs: f64,
+) -> Vec<TranscriptionDiarizationSegment> {
+    if segments.len() < 2 || word_count == 0 {
+        return segments;
+    }
+
+    let span = |s: &TranscriptionDiarizationSegment| (s.end_time - s.start_time).max(0.0);
+    let total: f64 = segments
+        .iter()
+        .map(span)
+        .sum::<f64>()
+        .max(duration_secs)
+        .max(0.001);
+    // Seconds of audio one readable row is worth, at this chunk's word rate.
+    let min_span = total * (MIN_WORDS_PER_DIARIZED_SEGMENT as f64) / word_count as f64;
+
+    let mut out: Vec<TranscriptionDiarizationSegment> = Vec::with_capacity(segments.len());
+    // Longest single contribution to the run currently at the end of `out`,
+    // so a merged run keeps the speaker who actually dominated it rather than
+    // whichever fragment happened to come first.
+    let mut held_floor = 0.0f64;
+
+    for segment in segments {
+        let Some(run) = out.last_mut() else {
+            held_floor = span(&segment);
+            out.push(segment);
+            continue;
+        };
+
+        let same_speaker = run.speaker_id.is_some() && run.speaker_id == segment.speaker_id;
+        if !same_speaker && span(run) >= min_span {
+            held_floor = span(&segment);
+            out.push(segment);
+            continue;
+        }
+
+        let segment_span = span(&segment);
+        if segment_span > held_floor {
+            held_floor = segment_span;
+            run.speaker_id = segment.speaker_id;
+            run.provider_speaker_label = segment.provider_speaker_label;
+        }
+        run.start_time = run.start_time.min(segment.start_time);
+        run.end_time = run.end_time.max(segment.end_time);
+        run.overlap |= segment.overlap;
+    }
+
+    // A trailing run can still be short — nothing followed it to absorb it, so
+    // fold it back into its predecessor rather than emitting a stub row.
+    if out.len() > 1 && span(&out[out.len() - 1]) < min_span {
+        let tail = out.pop().expect("len > 1");
+        let run = out.last_mut().expect("len > 1");
+        if span(&tail) > span(run) {
+            run.speaker_id = tail.speaker_id;
+            run.provider_speaker_label = tail.provider_speaker_label;
+        }
+        run.end_time = run.end_time.max(tail.end_time);
+        run.overlap |= tail.overlap;
+    }
+
+    out
+}
+
 fn assign_text_to_local_diarization(
     text: &str,
-    mut segments: Vec<TranscriptionDiarizationSegment>,
+    segments: Vec<TranscriptionDiarizationSegment>,
     duration_secs: f64,
 ) -> Vec<TranscriptionDiarizationSegment> {
     if segments.is_empty() {
@@ -1459,6 +1550,8 @@ fn assign_text_to_local_diarization(
     if words.is_empty() {
         return segments;
     }
+
+    let mut segments = coalesce_diarization_for_text(segments, words.len(), duration_secs);
 
     if segments.len() == 1 {
         segments[0].transcription = text.trim().to_string();
@@ -2704,6 +2797,75 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].transcription, "solo speaker");
         assert_eq!(rows[0].speaker_id, Some(42));
+    }
+
+    fn seg(speaker: Option<i64>, start: f64, end: f64) -> TranscriptionDiarizationSegment {
+        TranscriptionDiarizationSegment {
+            provider_speaker_label: match speaker {
+                Some(id) => format!("local:speaker_{id}"),
+                None => "local:unknown".to_string(),
+            },
+            speaker_id: speaker,
+            transcription: String::new(),
+            start_time: start,
+            end_time: end,
+            confidence: None,
+            overlap: false,
+        }
+    }
+
+    /// Reproduces a real 30s chunk that shipped as one-word rows: eight
+    /// pause-split segments dealt 17 words between them, so rows came out as
+    /// "All" / "right," / "okay," / "we". Every word was correct and in order —
+    /// only the row boundaries and speaker labels were nonsense.
+    #[test]
+    fn diarization_rows_are_phrases_not_single_words() {
+        let text = "All right, okay, we are complete. Marcel joining us in a short while, so let's get going.";
+        let segments = vec![
+            seg(Some(852), 0.0, 1.1),
+            seg(Some(874), 1.1, 2.0),
+            seg(Some(874), 2.0, 3.2),
+            seg(Some(852), 3.2, 4.0),
+            seg(Some(852), 4.0, 9.5),
+            seg(Some(852), 9.5, 10.2),
+            seg(None, 10.2, 15.0),
+            seg(Some(852), 15.0, 30.0),
+        ];
+
+        let assigned = assign_text_to_local_diarization(text, segments, 30.0);
+
+        for row in &assigned {
+            let words = row.transcription.split_whitespace().count();
+            assert!(
+                words >= MIN_WORDS_PER_DIARIZED_SEGMENT,
+                "row {:?} carries {} word(s)",
+                row.transcription,
+                words
+            );
+        }
+
+        // Coalescing must not drop, duplicate, or reorder a single word.
+        let rejoined = assigned
+            .iter()
+            .map(|row| row.transcription.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(rejoined, text);
+    }
+
+    /// The floor must not flatten a genuine two-speaker exchange into one row
+    /// when each turn is long enough to stand on its own.
+    #[test]
+    fn distinct_speakers_with_enough_words_stay_separate() {
+        let text = "so what did the vendor actually commit to in writing \
+                    they committed to the migration date but nothing about the data cleanup";
+        let segments = vec![seg(Some(11), 0.0, 15.0), seg(Some(22), 15.0, 30.0)];
+
+        let assigned = assign_text_to_local_diarization(text, segments, 30.0);
+
+        assert_eq!(assigned.len(), 2, "{assigned:?}");
+        assert_eq!(assigned[0].speaker_id, Some(11));
+        assert_eq!(assigned[1].speaker_id, Some(22));
     }
 
     #[test]
