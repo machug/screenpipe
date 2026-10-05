@@ -264,6 +264,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
         MeetingDetectionProfile {
             app_identifiers: AppIdentifiers {
                 macos_app_names: &[],
+                linux_process_names: &[],
                 windows_process_names: &[],
                 browser_url_patterns: &["app.slack.com/huddle"],
                 browser_title_patterns: &["Huddles"],
